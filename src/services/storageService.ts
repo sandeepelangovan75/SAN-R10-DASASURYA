@@ -25,6 +25,7 @@ import {
 } from '../types';
 import { HEAD_PILLARS, COURSES, getHeadById } from '../data/curriculum';
 import { DEFAULT_LANGUAGE_PREFERENCES } from '../data/languages';
+import { supabaseDbService } from './supabaseDbService';
 
 const STORAGE_KEYS = {
   ACCOUNTS: 'dasasurya_accounts_v2',
@@ -323,6 +324,13 @@ export const storageService = {
       updatedAt: new Date().toISOString(),
     };
     setToStorage(STORAGE_KEYS.PROFILES, profiles);
+
+    // Sync to Supabase profiles table if authenticated
+    try {
+      supabaseDbService.upsertProfile(profile).catch(() => {});
+    } catch (e) {
+      // Ignored for offline/local storage fallback
+    }
   },
 
   updateLanguagePreferences(userId: string, prefs: LanguagePreferences): void {
@@ -338,6 +346,10 @@ export const storageService = {
       prof.languagePreferences = prefs;
       this.saveProfile(prof);
     }
+
+    try {
+      supabaseDbService.saveUserPreferences(userId, prefs).catch(() => {});
+    } catch (e) {}
   },
 
   updateParentalConsent(userId: string, consentUpdate: Partial<ParentalConsentRecord>): void {
@@ -434,6 +446,9 @@ export const storageService = {
 
     allProgress[userId] = userProgress;
     setToStorage(STORAGE_KEYS.PROGRESS, allProgress);
+    try {
+      supabaseDbService.upsertProgress(userProgress).catch(() => {});
+    } catch (e) {}
   },
 
   recordQuizResult(userId: string, chapterId: string, scorePercent: number): void {
@@ -455,6 +470,9 @@ export const storageService = {
 
     allProgress[userId] = userProgress;
     setToStorage(STORAGE_KEYS.PROGRESS, allProgress);
+    try {
+      supabaseDbService.upsertProgress(userProgress).catch(() => {});
+    } catch (e) {}
     this.addCredits(userId, 20, `Passed Socratic Check for ${chapterId}`);
   },
 
@@ -482,6 +500,9 @@ export const storageService = {
 
     allProgress[userId] = userProgress;
     setToStorage(STORAGE_KEYS.PROGRESS, allProgress);
+    try {
+      supabaseDbService.upsertProgress(userProgress).catch(() => {});
+    } catch (e) {}
     this.addCredits(userId, 30, `Completed Practice for ${chapterId}`);
   },
 
@@ -505,6 +526,9 @@ export const storageService = {
 
     allProgress[userId] = userProgress;
     setToStorage(STORAGE_KEYS.PROGRESS, allProgress);
+    try {
+      supabaseDbService.upsertProgress(userProgress).catch(() => {});
+    } catch (e) {}
     this.addCredits(userId, 40, `Completed Chapter Mastery & Reflection`);
   },
 
@@ -651,6 +675,10 @@ export const storageService = {
       timestamp: new Date().toISOString(),
     });
     setToStorage(STORAGE_KEYS.CREDITS, all);
+
+    try {
+      supabaseDbService.addActivityRecord(userId, amount, action).catch(() => {});
+    } catch (e) {}
   },
 
   // RAVANA MIND
@@ -752,11 +780,19 @@ export const storageService = {
     const all = getFromStorage<MultilingualRoadmap[]>(STORAGE_KEYS.ROADMAPS, []);
     all.unshift(roadmap);
     setToStorage(STORAGE_KEYS.ROADMAPS, all);
+
+    try {
+      supabaseDbService.saveRoadmap(roadmap).catch(() => {});
+    } catch (e) {}
   },
 
   deleteRoadmap(roadmapId: string): void {
     const all = getFromStorage<MultilingualRoadmap[]>(STORAGE_KEYS.ROADMAPS, []);
     setToStorage(STORAGE_KEYS.ROADMAPS, all.filter(r => r.id !== roadmapId));
+
+    try {
+      supabaseDbService.deleteRoadmap(roadmapId).catch(() => {});
+    } catch (e) {}
   },
 
   // Admin Studio: Content Drafts & Publishing

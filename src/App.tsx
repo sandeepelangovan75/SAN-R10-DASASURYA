@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { storageService } from './services/storageService';
+import { supabaseAuthService } from './services/supabaseAuthService';
+import { supabaseDbService } from './services/supabaseDbService';
 import { Bookmark, UserAccount, UserNote, UserProfile, UserProgress } from './types';
 
 // Layout & Public Components
@@ -59,16 +61,100 @@ export default function App() {
   const [dailyBriefOpen, setDailyBriefOpen] = useState(false);
   const [adminConsoleOpen, setAdminConsoleOpen] = useState(false);
 
-  // Load existing session on mount
+  // Load existing session on mount with Supabase synchronization
   useEffect(() => {
-    const user = storageService.getActiveUser();
-    if (user) {
-      setCurrentUser(user);
-      const prof = storageService.getProfile(user.id);
-      setCurrentProfile(prof);
-      refreshUserData(user.id);
-      setActiveView('dashboard');
+    async function initSession() {
+      // 1. Check Supabase authenticated session
+      if (supabaseAuthService.isConfigured()) {
+        try {
+          const { session } = await supabaseAuthService.getSession();
+          if (session?.user) {
+            const supUser = session.user;
+            const cloudProfile = await supabaseDbService.getProfile(supUser.id);
+            const cloudProgress = await supabaseDbService.getProgress(supUser.id);
+
+            let account = storageService.getAccounts().find(a => 
+              a.id === supUser.id || 
+              (supUser.email && a.email.toLowerCase() === supUser.email.toLowerCase())
+            );
+
+            if (!account) {
+              const meta = supUser.user_metadata || {};
+              account = {
+                id: supUser.id,
+                fullName: cloudProfile?.fullName || meta.full_name || 'Learner',
+                username: cloudProfile?.username || meta.username || supUser.email?.split('@')[0] || 'learner',
+                email: supUser.email || '',
+                phone: supUser.phone || meta.phone,
+                verificationChannel: supUser.phone ? 'phone' : 'email',
+                isVerified: true,
+                verifiedAt: supUser.confirmed_at || new Date().toISOString(),
+                dateOfBirth: cloudProfile?.dateOfBirth || meta.date_of_birth || '2000-01-01',
+                age: cloudProfile?.age || 20,
+                isUnder12: Boolean(cloudProfile?.isUnder12),
+                isMinor: (cloudProfile?.age || 20) < 18,
+                passwordHash: '',
+                role: (cloudProfile?.role as any) || 'learner',
+                consentRecords: [],
+                languagePreferences: cloudProfile?.languagePreferences || {
+                  interfaceLanguage: 'en',
+                  responseLanguage: 'en',
+                  learningLanguage: 'en',
+                },
+                createdAt: supUser.created_at || new Date().toISOString(),
+              };
+              storageService.saveAccount(account);
+            } else {
+              account.id = supUser.id;
+              storageService.saveAccount(account);
+            }
+
+            if (cloudProfile) {
+              storageService.saveProfile(cloudProfile);
+            }
+
+            storageService.setActiveSession(account.id);
+            setCurrentUser(account);
+            setCurrentProfile(cloudProfile || storageService.getProfile(account.id));
+            refreshUserData(account.id);
+            setActiveView('dashboard');
+            return;
+          }
+        } catch (e) {
+          console.warn('Supabase session initialization note:', e);
+        }
+      }
+
+      // 2. Fallback to local session
+      const user = storageService.getActiveUser();
+      if (user) {
+        setCurrentUser(user);
+        const prof = storageService.getProfile(user.id);
+        setCurrentProfile(prof);
+        refreshUserData(user.id);
+        setActiveView('dashboard');
+      }
     }
+
+    initSession();
+
+    // Subscribe to auth state transitions
+    const { data: authListener } = supabaseAuthService.onAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_OUT') {
+        storageService.signOut();
+        setCurrentUser(null);
+        setCurrentProfile(null);
+        setUserProgress(null);
+        setBookmarks([]);
+        setNotes([]);
+        setCredits(0);
+        setActiveView('home');
+      }
+    });
+
+    return () => {
+      authListener?.subscription?.unsubscribe();
+    };
   }, []);
 
   const refreshUserData = (userId: string) => {
@@ -94,7 +180,10 @@ export default function App() {
     }
   };
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
+    try {
+      await supabaseAuthService.signOut();
+    } catch (e) {}
     storageService.signOut();
     setCurrentUser(null);
     setCurrentProfile(null);
@@ -131,6 +220,12 @@ export default function App() {
           credits={credits}
           activeView={activeView}
           onNavigate={(view) => {
+            const publicViews = ['home', 'tenheads', 'methodology', 'faq'];
+            if (!currentUser && !publicViews.includes(view)) {
+              setAuthMode('signin');
+              setAuthModalOpen(true);
+              return;
+            }
             if (view === 'home' && currentUser) {
               setActiveView('dashboard');
             } else {
@@ -265,7 +360,10 @@ export default function App() {
             bookmarks={bookmarks}
             notes={notes}
             credits={credits}
-            onUpdateProfile={(updated) => setCurrentProfile(updated)}
+            onUpdateProfile={(updated) => {
+              setCurrentProfile(updated);
+              storageService.saveProfile(updated);
+            }}
             onOpenChapter={handleOpenChapter}
             onBackToDashboard={() => setActiveView('dashboard')}
           />

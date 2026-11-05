@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { storageService, calculateAge } from '../../services/storageService';
+import { supabaseAuthService } from '../../services/supabaseAuthService';
+import { supabaseDbService } from '../../services/supabaseDbService';
 import { LanguageCode, UserAccount, VerificationChannel } from '../../types';
 import { SUPPORTED_LANGUAGES } from '../../data/languages';
 import { 
@@ -16,7 +18,10 @@ import {
   KeyRound, 
   Info,
   Clock,
-  RotateCcw
+  RotateCcw,
+  Database,
+  Check,
+  Key
 } from 'lucide-react';
 
 interface AuthModalProps {
@@ -52,6 +57,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [loginIdentifier, setLoginIdentifier] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
 
+  // Password Reset State
+  const [isResettingPassword, setIsResettingPassword] = useState(false);
+  const [resetEmail, setResetEmail] = useState('');
+  const [resetSuccessMessage, setResetSuccessMessage] = useState<string | null>(null);
+
   // Verification Step State
   const [isVerifying, setIsVerifying] = useState(false);
   const [verificationCode, setVerificationCode] = useState('');
@@ -61,6 +71,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
   // Status & Error
   const [error, setError] = useState<string | null>(null);
+  const [successNotice, setSuccessNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   // Calculate age
@@ -90,6 +101,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const handleInitiateRegistration = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setSuccessNotice(null);
     setLoading(true);
 
     if (!fullName.trim()) {
@@ -129,7 +141,36 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
 
     try {
-      // Call server verification dispatch endpoint
+      let supabaseMessage = '';
+
+      // 1. Supabase Auth registration dispatch
+      if (supabaseAuthService.isConfigured()) {
+        if (verificationChannel === 'email') {
+          const supRes = await supabaseAuthService.signUp({
+            email: contactValue,
+            password,
+            fullName,
+            username,
+            dateOfBirth,
+            preferredLanguage,
+            parentName: isUnder12 ? parentName : undefined,
+            parentContact: isUnder12 ? parentContact : undefined,
+          });
+
+          if (supRes.error && !supRes.error.toLowerCase().includes('already registered')) {
+            console.info('Supabase signUp note:', supRes.error);
+          } else if (supRes.message) {
+            supabaseMessage = supRes.message;
+          }
+        } else {
+          const supOtp = await supabaseAuthService.sendOtp(contactValue, 'phone');
+          if (supOtp.message) {
+            supabaseMessage = supOtp.message;
+          }
+        }
+      }
+
+      // 2. Server verification token dispatch as sync fallback
       const res = await fetch('/api/auth/send-verification', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -140,11 +181,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       });
 
       const data = await res.json();
-      if (!res.ok) {
+      if (!res.ok && !supabaseMessage) {
         throw new Error(data.error || 'Failed to dispatch verification code.');
       }
 
-      setProviderStatus(data.providerStatus);
+      setProviderStatus(supabaseMessage || data.providerStatus);
       if (data.testCode) {
         setTestCodeNotice(data.testCode);
       }
@@ -164,6 +205,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setLoading(true);
 
     try {
+      if (supabaseAuthService.isConfigured()) {
+        await supabaseAuthService.sendOtp(contactValue, verificationChannel);
+      }
+
       const res = await fetch('/api/auth/send-verification', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -201,21 +246,36 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setError(null);
 
     try {
-      const res = await fetch('/api/auth/verify-code', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contact: contactValue,
-          code: verificationCode.trim(),
-        }),
-      });
+      let verifiedBySupabase = false;
+      let authenticatedSupabaseUser: any = null;
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Verification code failed.');
+      // 1. Verify via Supabase Auth
+      if (supabaseAuthService.isConfigured()) {
+        const supVerify = await supabaseAuthService.verifyOtp(contactValue, verificationCode.trim(), verificationChannel);
+        if (supVerify.success) {
+          verifiedBySupabase = true;
+          authenticatedSupabaseUser = supVerify.user;
+        }
       }
 
-      // Verification confirmed by server: Register account locally
+      // 2. If not verified via Supabase, verify with server endpoint
+      if (!verifiedBySupabase) {
+        const res = await fetch('/api/auth/verify-code', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contact: contactValue,
+            code: verificationCode.trim(),
+          }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Verification code failed. Please check the code and try again.');
+        }
+      }
+
+      // 3. Register user account locally
       const regRes = storageService.registerAccount({
         fullName,
         username,
@@ -233,16 +293,29 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         throw new Error(regRes.error || 'Failed to initialize account.');
       }
 
-      onSuccess(regRes.user, true);
+      const activeUser = regRes.user;
+      if (authenticatedSupabaseUser?.id) {
+        activeUser.id = authenticatedSupabaseUser.id;
+        storageService.saveAccount(activeUser);
+        storageService.setActiveSession(activeUser.id);
+      }
+
+      // 4. Save user profile to Supabase profiles table
+      const profile = storageService.getProfile(activeUser.id);
+      if (profile) {
+        await supabaseDbService.upsertProfile(profile);
+      }
+
+      onSuccess(activeUser, true);
     } catch (err: any) {
-      setError(err.message);
+      setError(err.message || 'Verification failed. Please check code.');
     } finally {
       setLoading(false);
     }
   };
 
   // Sign In Submission
-  const handleSignIn = (e: React.FormEvent) => {
+  const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setLoading(true);
@@ -253,15 +326,108 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       return;
     }
 
-    const res = storageService.authenticate(loginIdentifier, loginPassword);
-    setLoading(false);
+    try {
+      let authenticatedUser: UserAccount | null = null;
 
-    if (!res.success || !res.user) {
-      setError(res.error || 'Authentication failed. Please verify credentials.');
+      // 1. Try Supabase Auth
+      if (supabaseAuthService.isConfigured()) {
+        const supRes = await supabaseAuthService.signInWithPassword(loginIdentifier, loginPassword);
+        if (supRes.success && supRes.user) {
+          const supUser = supRes.user;
+          const cloudProfile = await supabaseDbService.getProfile(supUser.id);
+
+          let account = storageService.getAccounts().find(a => 
+            a.id === supUser.id || 
+            (supUser.email && a.email.toLowerCase() === supUser.email.toLowerCase())
+          );
+
+          if (!account) {
+            const meta = supUser.user_metadata || {};
+            account = {
+              id: supUser.id,
+              fullName: cloudProfile?.fullName || meta.full_name || 'Learner',
+              username: cloudProfile?.username || meta.username || supUser.email?.split('@')[0] || 'learner',
+              email: supUser.email || '',
+              phone: supUser.phone || meta.phone,
+              verificationChannel: supUser.phone ? 'phone' : 'email',
+              isVerified: true,
+              verifiedAt: supUser.confirmed_at || new Date().toISOString(),
+              dateOfBirth: cloudProfile?.dateOfBirth || meta.date_of_birth || '2000-01-01',
+              age: cloudProfile?.age || 20,
+              isUnder12: Boolean(cloudProfile?.isUnder12),
+              isMinor: (cloudProfile?.age || 20) < 18,
+              passwordHash: btoa(loginPassword),
+              role: (cloudProfile?.role as any) || 'learner',
+              consentRecords: [],
+              languagePreferences: cloudProfile?.languagePreferences || {
+                interfaceLanguage: 'en',
+                responseLanguage: 'en',
+                learningLanguage: 'en',
+              },
+              createdAt: supUser.created_at || new Date().toISOString(),
+            };
+            storageService.saveAccount(account);
+          } else {
+            account.id = supUser.id;
+            storageService.saveAccount(account);
+          }
+
+          if (cloudProfile) {
+            storageService.saveProfile(cloudProfile);
+          }
+
+          storageService.setActiveSession(account.id);
+          authenticatedUser = account;
+        } else if (supRes.requiresOtp) {
+          setContactValue(loginIdentifier);
+          setVerificationChannel(loginIdentifier.includes('@') ? 'email' : 'phone');
+          setIsVerifying(true);
+          setError('Email registered in Supabase but not yet confirmed. Please enter the OTP code sent to your inbox.');
+          setLoading(false);
+          return;
+        }
+      }
+
+      // 2. Fallback to storageService if not authenticated via Supabase
+      if (!authenticatedUser) {
+        const res = storageService.authenticate(loginIdentifier, loginPassword);
+        if (!res.success || !res.user) {
+          throw new Error(res.error || 'Authentication failed. Please verify credentials or create an account.');
+        }
+        authenticatedUser = res.user;
+      }
+
+      onSuccess(authenticatedUser, false);
+    } catch (err: any) {
+      setError(err.message || 'Authentication failed. Please check your credentials.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Password Reset Handler
+  const handleResetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!resetEmail.trim() || !resetEmail.includes('@')) {
+      setError('Please provide a valid registered email address.');
       return;
     }
 
-    onSuccess(res.user, false);
+    setLoading(true);
+    setError(null);
+    setResetSuccessMessage(null);
+
+    try {
+      const res = await supabaseAuthService.resetPassword(resetEmail);
+      if (!res.success) {
+        throw new Error(res.error || 'Failed to dispatch password reset link.');
+      }
+      setResetSuccessMessage('Password reset link dispatched! Please check your email inbox.');
+    } catch (err: any) {
+      setError(err.message || 'Password reset request failed.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -280,23 +446,35 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         </button>
 
         {/* Header */}
-        <div className="space-y-1 mb-5">
-          <div className="flex items-center gap-2 text-xs font-mono text-violet-400 font-semibold tracking-wide">
-            <span>SAN_R-10</span>
-            <span>·</span>
-            <span>DASASURYA IDENTITY & SECURITY</span>
+        <div className="space-y-1.5 mb-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-xs font-mono text-violet-400 font-semibold tracking-wide">
+              <span>SAN_R-10</span>
+              <span>·</span>
+              <span>DASASURYA IDENTITY & SECURITY</span>
+            </div>
+            {supabaseAuthService.isConfigured() && (
+              <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-950/60 border border-emerald-500/30 text-[10px] font-mono text-emerald-300">
+                <Database className="w-3 h-3 text-emerald-400" />
+                <span>Supabase Auth & RLS Connected</span>
+              </div>
+            )}
           </div>
           <h3 className="text-2xl font-bold text-white tracking-tight">
-            {mode === 'register' 
-              ? isVerifying ? 'Confirm Verification' : 'Create Secure Account' 
-              : 'Sign In to Your Sanctuary'}
+            {isResettingPassword 
+              ? 'Reset Your Password'
+              : mode === 'register' 
+                ? isVerifying ? 'Confirm Verification' : 'Create Secure Account' 
+                : 'Sign In to Your Sanctuary'}
           </h3>
           <p className="text-xs text-slate-400">
-            {mode === 'register'
-              ? isVerifying 
-                ? `Enter the code sent to your ${verificationChannel}.`
-                : 'Configure language, verified credentials, and age safeguards.'
-              : 'Access your sovereign learning roadmaps, chapter notes, and chakra sessions.'}
+            {isResettingPassword
+              ? 'Receive an authenticated reset link dispatched to your registered email.'
+              : mode === 'register'
+                ? isVerifying 
+                  ? `Enter the code sent to your ${verificationChannel}.`
+                  : 'Configure language, verified credentials, and age safeguards.'
+                : 'Access your sovereign learning roadmaps, chapter notes, and chakra sessions.'}
           </p>
         </div>
 
@@ -305,6 +483,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           <div className="mb-4 p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 flex items-start gap-2.5 text-xs text-rose-300">
             <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
             <span className="leading-relaxed">{error}</span>
+          </div>
+        )}
+
+        {/* Success notification */}
+        {(successNotice || resetSuccessMessage) && (
+          <div className="mb-4 p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-start gap-2.5 text-xs text-emerald-300">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+            <span className="leading-relaxed">{successNotice || resetSuccessMessage}</span>
           </div>
         )}
 
@@ -668,6 +854,22 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               </div>
             </div>
 
+            <div className="flex items-center justify-between text-xs pt-1">
+              <span className="text-slate-500 font-mono text-[11px]">Protected Session</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setError(null);
+                  setResetSuccessMessage(null);
+                  setIsResettingPassword(true);
+                  setResetEmail(loginIdentifier.includes('@') ? loginIdentifier : '');
+                }}
+                className="text-violet-400 hover:text-violet-300 transition-colors underline"
+              >
+                Forgot password?
+              </button>
+            </div>
+
             <button
               type="submit"
               disabled={loading}
@@ -675,6 +877,56 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             >
               {loading ? 'Authenticating...' : 'Sign In'}
             </button>
+          </form>
+        )}
+
+        {/* ------------------------------------------------------------- */}
+        {/* VIEW 4: FORGOT / RESET PASSWORD */}
+        {/* ------------------------------------------------------------- */}
+        {isResettingPassword && (
+          <form onSubmit={handleResetPassword} className="space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">
+                Registered Email Address
+              </label>
+              <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
+                  <Mail className="w-4 h-4" />
+                </div>
+                <input
+                  type="email"
+                  required
+                  value={resetEmail}
+                  onChange={(e) => setResetEmail(e.target.value)}
+                  placeholder="learner@example.com"
+                  className="w-full pl-9 pr-3 py-2 bg-black/40 border border-white/10 rounded-lg text-xs text-white placeholder-slate-500 focus:outline-none focus:border-violet-500"
+                />
+              </div>
+              <p className="text-[11px] text-slate-400 mt-1.5 leading-relaxed">
+                Supabase Auth will dispatch a secure single-use password recovery link to your inbox.
+              </p>
+            </div>
+
+            <div className="flex gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsResettingPassword(false);
+                  setError(null);
+                  setResetSuccessMessage(null);
+                }}
+                className="w-1/3 py-2 px-3 rounded-lg bg-white/10 hover:bg-white/15 text-slate-300 text-xs font-medium transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-2/3 py-2 px-3 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-xs font-medium transition-colors shadow-sm"
+              >
+                {loading ? 'Dispatching...' : 'Send Recovery Link'}
+              </button>
+            </div>
           </form>
         )}
 

@@ -405,6 +405,7 @@ export interface UserProfile {
   dateOfBirth?: string;
   age?: number;
   isUnder12?: boolean;
+  role?: UserRole;
   languagePreferences: LanguagePreferences;
   createdAt: string;
   updatedAt: string;
